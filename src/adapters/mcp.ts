@@ -37,14 +37,18 @@ import {
   blockedInfoForBatch,
   checkOptionsFor,
   decisionFromGuardError,
+  hookContextFor,
   hostAbortSignal,
   mapContractCalls,
   mappingFailureFor,
+  resolveCorrelationId,
   runBlockedHook,
   runDecisionHook,
   runMappingErrorHook,
   type BlockedHookLogger,
+  type CorrelationIdOption,
   type GuardBlockedHook,
+  type GuardHookContext,
   type GuardMappingErrorHook,
 } from "./shared.ts";
 
@@ -92,7 +96,19 @@ export interface McpGuardOptions {
    */
   toContractCalls?: (request: McpToolCallRequest) => readonly ContractCall[] | null;
   /** Observe every decision — the place to wire telemetry. */
-  onDecision?: (request: McpToolCallRequest, decision: PreFlightDecision) => void;
+  onDecision?: (
+    request: McpToolCallRequest,
+    decision: PreFlightDecision,
+    context: GuardHookContext,
+  ) => void;
+  /**
+   * Caller correlation id for this tool call (issue #459), either fixed or
+   * mapped from the MCP request. It is added to every hook payload for the
+   * action. Omitted — or blank — stays absent; the SDK never derives one from
+   * addresses, tool arguments or timestamps. Treat it as operator metadata: it
+   * may identify a user or run, so do not log it with secrets.
+   */
+  correlationId?: CorrelationIdOption<[request: McpToolCallRequest]>;
   /**
    * Operator alerting on every halt, on the same shared payload as the other
    * adapters (`{ adapter: "mcp", kind, reason, call, explanation }`). A throwing
@@ -151,6 +167,9 @@ async function guardMcpRequest<T extends McpToolResult>(
   options: McpGuardOptions,
   hostSignal?: AbortSignal | undefined,
 ): Promise<T | McpToolResult> {
+  // Resolve the id once, before the mapper, so every hook for this action —
+  // including a mapping failure — carries the same value.
+  const correlationId = resolveCorrelationId(options.correlationId, request);
   let calls: ContractCall[];
   try {
     calls = mapContractCalls(request, options);
@@ -162,6 +181,7 @@ async function guardMcpRequest<T extends McpToolResult>(
       error,
       request.name,
       options.includeMappingErrorRequest ? request : undefined,
+      correlationId,
     );
     runMappingErrorHook(options.onMappingError, failure.mapping, options.blockedHookLogger);
     runBlockedHook(options.onBlocked, failure.info, options.blockedHookLogger);
@@ -185,12 +205,17 @@ async function guardMcpRequest<T extends McpToolResult>(
         throw error;
       }
     }
-    runDecisionHook(options.onDecision, [request, decision], "mcp", options.blockedHookLogger);
+    runDecisionHook(
+      options.onDecision,
+      [request, decision, hookContextFor(correlationId)],
+      "mcp",
+      options.blockedHookLogger,
+    );
     if (decision.allowed) return proceed();
 
     runBlockedHook(
       options.onBlocked,
-      blockedInfoFor("mcp", calls[0]!, decision),
+      blockedInfoFor("mcp", calls[0]!, decision, correlationId),
       options.blockedHookLogger,
     );
     return {
@@ -221,13 +246,18 @@ async function guardMcpRequest<T extends McpToolResult>(
     }
   }
   for (const verdict of batch.verdicts) {
-    runDecisionHook(options.onDecision, [request, verdict], "mcp", options.blockedHookLogger);
+    runDecisionHook(
+      options.onDecision,
+      [request, verdict, hookContextFor(correlationId)],
+      "mcp",
+      options.blockedHookLogger,
+    );
   }
   if (batch.admissible) return proceed();
 
   runBlockedHook(
     options.onBlocked,
-    blockedInfoForBatch("mcp", calls, batch.verdicts),
+    blockedInfoForBatch("mcp", calls, batch.verdicts, correlationId),
     options.blockedHookLogger,
   );
   const refusal = batch.verdicts.find((verdict) => !verdict.allowed)!;
