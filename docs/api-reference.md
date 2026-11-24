@@ -97,6 +97,10 @@ const result = await hb.stop({ timeoutMs: 5_000 });
 
 The heartbeat loop keeps a fixed cadence. When a submission outlives one or more intervals, the stale slots are skipped instead of being fired back-to-back: each is counted once in `handle.missedBeats`, and the next beat waits for the next future deadline. A late wake still reports `lateMs` relative to the slot the beat represents. The same-second duplicate courtesy and the contract's own authority are unchanged.
 
+#### Cadence jitter (issue #460)
+
+A fleet started from one template can beat in lockstep. `jitter: "full"` opts into a spread: each beat is scheduled uniformly in `[deadline - j·intervalMs, deadline]`, where `j = jitterFraction` (default `DEFAULT_JITTER_FRACTION`, 0.2). The fixed deadline still advances by exactly `intervalMs`, so the early window cannot accumulate into a permanent drift; `lateMs` and `missedBeats` are still measured against that deadline, so jitter is never reported as lateness or a missed beat. `jitter: "none"` (the default) reproduces the pre-existing cadence exactly. `random` injects the jitter RNG for deterministic tests. The implementation reuses telemetry's `computePollDelay` helper.
+
 #### Fee units: stroops and XLM
 
 `CostPreChecker` reports fees as exact integer stroops — the raw value is the
