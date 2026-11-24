@@ -377,6 +377,7 @@ export {
 } from "./wasm.ts";
 
 export {
+  DEFAULT_HEARTBEAT_JITTER,
   DEFAULT_HEARTBEAT_RETRY_OPTIONS,
   HeartbeatBlockedError,
   HeartbeatDryRunError,
@@ -388,6 +389,7 @@ export {
   submitHeartbeat,
   type HeartbeatBeat,
   type HeartbeatHandle,
+  type HeartbeatJitter,
   type HeartbeatOptions,
   type HeartbeatParams,
   type HeartbeatResult,
