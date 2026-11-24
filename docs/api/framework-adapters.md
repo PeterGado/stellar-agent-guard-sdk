@@ -75,8 +75,8 @@ halt, on every adapter; `onBlocked` still fires afterwards for compatibility.
 
 | Hook | Fires for | Payload | Use it for |
 | --- | --- | --- | --- |
-| `onMappingError` | Only a mapper that threw or returned a malformed call. Never for a guard verdict. | `{ adapter, tool, errorClass, error }`; `request` only when opted in. | Paging the team that owns the integration, grouping mapper bugs. |
-| `onBlocked` | Every halt: a `blocked` refusal, an `undetermined` enforcement run, and (for compatibility) a mapping failure. | `{ adapter, kind, reason, call?, explanation }`. | Policy/operator alerting and audit trails. |
+| `onMappingError` | Only a mapper that threw or returned a malformed call. Never for a guard verdict. | `{ adapter, tool, errorClass, error, correlationId? }`; `request` only when opted in. | Paging the team that owns the integration, grouping mapper bugs. |
+| `onBlocked` | Every halt: a `blocked` refusal, an `undetermined` enforcement run, and (for compatibility) a mapping failure. | `{ adapter, kind, reason, call?, explanation, correlationId? }`. | Policy/operator alerting and audit trails. |
 
 ```ts
 createLangChainGuardMiddleware({
@@ -114,9 +114,10 @@ createLangChainGuardMiddleware({
 
 Every adapter accepts an optional `correlationId`: either a fixed string or a
 callback that reads an id out of the framework request. It is added to every
-hook for one action — `onBlocked`, the `onDecision` context, and the
-`onBlocked` payload that reports a mapping failure — so an operator alert can
-be joined to the agent run or user request that produced it.
+hook for one action — `onBlocked`, the `onDecision` context, and both payloads
+that report a mapping failure (`onMappingError` and the compatibility
+`onBlocked` halt) — so an operator alert can be joined to the agent run or user
+request that produced it.
 
 ```ts
 createLangChainGuardMiddleware({
@@ -126,6 +127,9 @@ createLangChainGuardMiddleware({
   correlationId: (request) => request.toolCall.id,
   onDecision: (_request, decision, context) => {
     telemetry.record({ decision, correlationId: context.correlationId });
+  },
+  onMappingError: (info) => {
+    reportIntegrationBug({ correlationId: info.correlationId, tool: info.tool });
   },
   onBlocked: (info) => {
     alert(`${info.correlationId ?? "no-id"}: ${info.kind}`);
@@ -152,8 +156,8 @@ identifies. The SDK stores it only for the duration of the action.
 The callback receives the same request shape as the adapter's mapper: the
 tool-call request (LangChain), the tool call (Vercel AI), the MCP request, or
 `(message, state)` (ElizaOS). The Vercel AI adapter has no `onBlocked` hook, so
-there it appears on `onDecision`; LangChain, ElizaOS and MCP also expose it on
-`onBlocked`, including mapping-failure halts.
+there it appears on `onDecision` and `onMappingError`; LangChain, ElizaOS and MCP
+also expose it on `onBlocked`, including mapping-failure halts.
 
 ## Observer hooks: never awaited, never unhandled
 
