@@ -35,6 +35,7 @@ export {
   PolicyEncodeError,
   PolicyFileReadError,
   PolicyValidationError,
+  SignerTimeoutError,
   SigningError,
   RateLimitedError,
   SimulationError,
@@ -97,10 +98,15 @@ export {
 
 export type { ActiveWindowState, DescribePolicyOptions } from "./policy.ts";
 
-export { DMS_WARN_RATIO_DEFAULT, dmsUrgency } from "./dms.ts";
+export { DMS_WARN_RATIO_DEFAULT, dmsUrgency, formatDmsCountdown } from "./dms.ts";
 export { formatPolicyDiff, policyDiff } from "./policy-diff.ts";
 export type { PolicyChange, PolicyValue } from "./policy-diff.ts";
-export type { DmsUrgency } from "./dms.ts";
+export type {
+  DmsCountdown,
+  DmsCountdownState,
+  DmsUrgency,
+  FormatDmsCountdownOptions,
+} from "./dms.ts";
 
 export type {
   AccountAddress,
@@ -394,22 +400,30 @@ export {
 export type { TransferFromRequest, TransferRequest } from "./transfer.ts";
 
 export {
+  DEFAULT_ADMIN_OP_WAIT_TIMEOUT_MS,
   DEFAULT_NETWORK_PASSPHRASE,
   agentPubkeyToScVal,
   buildFreezeCall,
   buildRotateAgentKeyCall,
   buildSetPolicyCall,
   buildUnfreezeCall,
+  isAdminOpOutcome,
   previewSetPolicy,
   submitFreeze,
   submitRotateAgentKey,
   submitSetPolicy,
   submitUnfreeze,
+  waitForAdminOp,
 } from "./admin.ts";
 
 export type {
   AdminInvokeOutcome,
+  AdminOpMetadata,
+  AdminOpName,
+  AdminOpOutcome,
   AdminOpParams,
+  AdminOpWaitResult,
+  AdminOpWaitStatus,
   AdminOperation,
   AdminOutcomeMetadata,
   PolicyPreview,
@@ -418,6 +432,7 @@ export type {
   PreviewSetPolicyParams,
   RotateAgentKeyParams,
   SetPolicyParams,
+  WaitForAdminOpOptions,
 } from "./admin.ts";
 
 export {
@@ -538,6 +553,7 @@ export type {
 // when no logger is supplied: the SDK writes nothing unless a host asks.
 export {
   GUARD_LOG_LEVELS,
+  createRedactingLogger,
   redactLogMeta,
   SILENT_LOGGER,
   resolveLogger,

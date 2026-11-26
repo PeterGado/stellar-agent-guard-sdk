@@ -22,7 +22,7 @@ import {
   type HeartbeatState,
   type HeartbeatStateStore,
 } from "../../src/heartbeat.ts";
-import { BroadcastError, SimulationError } from "../../src/errors.ts";
+import { BroadcastError, SignerTimeoutError, SimulationError } from "../../src/errors.ts";
 import { RpcTimeoutError, type InvokeOutcome } from "../../src/invoke.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
@@ -744,6 +744,16 @@ describe("startHeartbeat input validation (issue #341)", () => {
       );
     }
   });
+
+  it("rejects an unusable signerTimeoutMs", async () => {
+    for (const signerTimeoutMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      await assert.rejects(
+        startHeartbeat(baseOptions({ signerTimeoutMs })),
+        (error: unknown) =>
+          error instanceof RangeError && /signerTimeoutMs/.test((error as Error).message),
+      );
+    }
+  });
 });
 
 /**
@@ -1393,6 +1403,19 @@ describe("heartbeat() one-shot (issue #75)", () => {
     const failed = new SimulationError("rpc down", { stage: "simulate" });
     const errored = { kind: "error", error: failed } as unknown as InvokeOutcome;
     await assert.rejects(heartbeatWith(errored, agent, server), (e: unknown) => e === failed);
+  });
+});
+
+describe("signer timeout retry classification (issue #472)", () => {
+  it("never retries a SignerTimeoutError as a transient heartbeat failure", () => {
+    const timeout = new SignerTimeoutError({ timeoutMs: 25 });
+    assert.equal(isRetryableHeartbeatFailure(timeout), false);
+    assert.equal(
+      isRetryableHeartbeatFailure(
+        new RpcTimeoutError({ stage: "invoke", aborted: false, timeoutMs: 25 }),
+      ),
+      true,
+    );
   });
 });
 

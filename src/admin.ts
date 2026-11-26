@@ -13,8 +13,9 @@
  * with zero duplicated encoder logic.
  */
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
-import { invoke, type InvokeOutcome } from "./invoke.ts";
+import { DEFAULT_RPC_TIMEOUT_MS, invoke, type InvokeOutcome } from "./invoke.ts";
 import { InvalidInputError, type PolicyEncodingFailure } from "./errors.ts";
+import { systemClock, type Clock } from "./clock.ts";
 import { hexToBytes } from "./hash.ts";
 import { policyDiff, type PolicyChange } from "./policy-diff.ts";
 import { policyHash } from "./policy-json.ts";
@@ -145,6 +146,12 @@ export interface AdminOpParams {
    * `0` to disable the bound and rely solely on `signal`.
    */
   timeoutMs?: number | undefined;
+  /**
+   * Optional local bound on each `AgentSigner.signDigest()` call inside the
+   * underlying `invoke()`, in milliseconds. `0` keeps the signer unbounded.
+   * A fired bound produces a typed `SignerTimeoutError` and is never retried.
+   */
+  signerTimeoutMs?: number | undefined;
 }
 
 export interface SetPolicyParams extends AdminOpParams {
@@ -157,6 +164,8 @@ export interface RotateAgentKeyParams extends AdminOpParams {
 
 /** The admin operation an outcome came from. */
 export type AdminOperation = "set_policy" | "freeze" | "unfreeze" | "rotate_agent_key";
+/** Backward-compatible alias for the admin operation name. */
+export type AdminOpName = AdminOperation;
 
 /**
  * Public, additive audit metadata attached to every admin outcome.
@@ -175,6 +184,28 @@ export interface AdminOutcomeMetadata {
 /** An `InvokeOutcome` that also carries admin audit metadata. */
 export type AdminInvokeOutcome = InvokeOutcome & { admin: AdminOutcomeMetadata };
 
+/** Identity of the admin operation that produced an {@link AdminOpOutcome}. */
+export interface AdminOpMetadata {
+  readonly op: AdminOpName;
+  readonly guard: ContractAddress;
+  /**
+   * The hash the network assigned, or `null` when the operation never reached a
+   * trackable broadcast (dry run, pre-broadcast failure, ambiguous response).
+   */
+  readonly transactionHash: string | null;
+}
+
+declare const adminOpBrand: unique symbol;
+/**
+ * An `invoke()` outcome returned by one of this module's submit helpers.
+ *
+ * The brand is type-only: `isAdminOpOutcome()` checks the runtime association,
+ * so a plain `InvokeOutcome` cannot be passed to `waitForAdminOp()` by accident.
+ */
+export type AdminOpOutcome = AdminInvokeOutcome & { readonly [adminOpBrand]: AdminOpMetadata };
+
+const ADMIN_OP_OUTCOMES = new WeakMap<object, AdminOpMetadata>();
+
 /** Attach metadata without spreading: outcomes can carry Error prototypes and getters. */
 function withAdminMetadata(
   outcome: InvokeOutcome,
@@ -183,12 +214,240 @@ function withAdminMetadata(
   return Object.assign(outcome, { admin });
 }
 
+function brandAdminOutcome(outcome: AdminInvokeOutcome, adminOp: AdminOpMetadata): AdminOpOutcome {
+  ADMIN_OP_OUTCOMES.set(outcome, adminOp);
+  return outcome as AdminOpOutcome;
+}
+
+/** True only for an outcome produced by one of this module's submit helpers. */
+export function isAdminOpOutcome(value: unknown): value is AdminOpOutcome {
+  return typeof value === "object" && value !== null && ADMIN_OP_OUTCOMES.has(value);
+}
+
+function nonEmptyHash(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Read the recovery hash from every outcome arm that can carry one. */
+function transactionHashOf(outcome: InvokeOutcome): string | null {
+  const record = outcome as {
+    transactionHash?: unknown;
+    submission?: { hash?: unknown } | null;
+    error?: { transactionHash?: unknown; error?: { transactionHash?: unknown } } | null;
+  };
+  return (
+    nonEmptyHash(record.transactionHash) ??
+    nonEmptyHash(record.submission?.hash) ??
+    nonEmptyHash(record.error?.transactionHash) ??
+    nonEmptyHash(record.error?.error?.transactionHash) ??
+    null
+  );
+}
+
+/** Default bound for {@link waitForAdminOp}; a timeout is reported as `pending`. */
+export const DEFAULT_ADMIN_OP_WAIT_TIMEOUT_MS = DEFAULT_RPC_TIMEOUT_MS;
+const DEFAULT_ADMIN_OP_POLL_INTERVAL_MS = 1_000;
+
+/** Terminal state of an admin operation's confirmation wait. */
+export type AdminOpWaitStatus = "confirmed" | "failed" | "pending" | "undetermined";
+
+/** What {@link waitForAdminOp} reports, with the submitting operation attached. */
+export interface AdminOpWaitResult {
+  readonly status: AdminOpWaitStatus;
+  readonly transactionHash: string;
+  readonly admin: AdminOpMetadata;
+  /** One-line operator summary; never a substitute for `status`. */
+  readonly detail: string;
+  /** Ledger that included the transaction, when the RPC reported one. */
+  readonly ledger: number | null;
+}
+
+export interface WaitForAdminOpOptions {
+  /** RPC used only for `getTransaction(hash)`; no submission is ever made. */
+  server: rpc.Server;
+  /**
+   * Overall wait budget in milliseconds. Defaults to
+   * `DEFAULT_ADMIN_OP_WAIT_TIMEOUT_MS` (30s). A fired bound returns `pending`:
+   * the transaction may still land. `0` waits without a time bound.
+   */
+  timeoutMs?: number | undefined;
+  /** Caller cancellation. An abort returns `pending`; it never rebroadcasts. */
+  signal?: AbortSignal | undefined;
+  /** Delay between `getTransaction` polls. Defaults to 1,000ms. */
+  pollIntervalMs?: number | undefined;
+  /** Time source for the budget and poll delays. Defaults to `systemClock`. */
+  clock?: Clock | undefined;
+}
+
+function assertWaitForAdminOpOptions(options: WaitForAdminOpOptions): void {
+  if (typeof options !== "object" || options === null) {
+    throw new InvalidInputError("options", "object", "waitForAdminOp requires options");
+  }
+  const server = options.server as { getTransaction?: unknown } | null | undefined;
+  if (!server || typeof server.getTransaction !== "function") {
+    throw new InvalidInputError("server", "rpc_server_with_getTransaction");
+  }
+  if (options.timeoutMs !== undefined) {
+    if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 0) {
+      throw new InvalidInputError(
+        "timeoutMs",
+        "finite_non_negative_number",
+        String(options.timeoutMs),
+      );
+    }
+  }
+  if (options.pollIntervalMs !== undefined) {
+    if (!Number.isFinite(options.pollIntervalMs) || options.pollIntervalMs < 0) {
+      throw new InvalidInputError(
+        "pollIntervalMs",
+        "finite_non_negative_number",
+        String(options.pollIntervalMs),
+      );
+    }
+  }
+  const signal = options.signal as
+    | { aborted?: unknown; addEventListener?: unknown; removeEventListener?: unknown }
+    | null
+    | undefined;
+  if (
+    signal !== undefined &&
+    signal !== null &&
+    (typeof signal.aborted !== "boolean" ||
+      typeof signal.addEventListener !== "function" ||
+      typeof signal.removeEventListener !== "function")
+  ) {
+    throw new InvalidInputError("signal", "abort_signal");
+  }
+  const clock = options.clock as unknown;
+  if (
+    clock !== undefined &&
+    (typeof clock !== "object" ||
+      clock === null ||
+      typeof (clock as Clock).now !== "function" ||
+      typeof (clock as Clock).sleep !== "function")
+  ) {
+    throw new InvalidInputError("clock", "object_with_now_and_sleep");
+  }
+}
+
+function abortableSleep(
+  clock: Clock,
+  delayMs: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (!signal) return clock.sleep(delayMs);
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void clock.sleep(Math.max(0, delayMs)).then(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    });
+  });
+}
+
 /**
- * Submit set_policy to the guard contract with an admin signer.
- * Reuses canonical policyToScVal without duplicating encoding logic.
+ * Wait for an admin submission's transaction to be included.
+ *
+ * This is a read-only confirmation wrapper: it calls `getTransaction(hash)`
+ * only, and returns a `pending` status (never a failure, never a rebroadcast)
+ * when the budget or cancellation stops the wait. An RPC error is reported as
+ * `undetermined` so the caller can reconcile the hash out of band.
  */
-export async function submitSetPolicy(params: SetPolicyParams): Promise<AdminInvokeOutcome> {
-  const call = buildSetPolicyCall(params.guard, params.policy);
+export async function waitForAdminOp(
+  outcome: AdminOpOutcome,
+  options: WaitForAdminOpOptions,
+): Promise<AdminOpWaitResult> {
+  assertWaitForAdminOpOptions(options);
+  if (!isAdminOpOutcome(outcome)) {
+    throw new InvalidInputError(
+      "outcome",
+      "admin_outcome",
+      "pass the result of submitSetPolicy, submitFreeze, submitUnfreeze or submitRotateAgentKey",
+    );
+  }
+  const adminOp = ADMIN_OP_OUTCOMES.get(outcome);
+  const transactionHash = adminOp?.transactionHash;
+  if (adminOp === undefined || transactionHash === null || transactionHash === undefined) {
+    throw new InvalidInputError(
+      "outcome",
+      "admin_outcome_transaction_hash",
+      "the operation has no trackable transaction hash",
+    );
+  }
+
+  const clock = options.clock ?? systemClock;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_ADMIN_OP_WAIT_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_ADMIN_OP_POLL_INTERVAL_MS;
+  const startedAt = clock.now();
+  const result = (
+    status: AdminOpWaitStatus,
+    detail: string,
+    ledger: number | null = null,
+  ): AdminOpWaitResult => ({ status, transactionHash, admin: adminOp, detail, ledger });
+
+  if (options.signal?.aborted) {
+    return result("pending", `wait for transaction ${transactionHash} was aborted`);
+  }
+
+  for (;;) {
+    const remainingMs = timeoutMs === 0 ? Infinity : timeoutMs - (clock.now() - startedAt);
+    if (remainingMs <= 0) {
+      return result(
+        "pending",
+        `transaction ${transactionHash} was not confirmed within ${timeoutMs}ms`,
+      );
+    }
+    if (options.signal?.aborted) {
+      return result("pending", `wait for transaction ${transactionHash} was aborted`);
+    }
+
+    let response: unknown;
+    try {
+      response = await options.server.getTransaction(transactionHash);
+    } catch (error) {
+      return result(
+        "undetermined",
+        `could not read transaction ${transactionHash}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (options.signal?.aborted) {
+      return result("pending", `wait for transaction ${transactionHash} was aborted`);
+    }
+
+    const statusValue = (response as { status?: unknown } | null)?.status;
+    const ledgerValue = (response as { ledger?: unknown } | null)?.ledger;
+    const ledger = typeof ledgerValue === "number" ? ledgerValue : null;
+    if (statusValue === rpc.Api.GetTransactionStatus.SUCCESS) {
+      return result("confirmed", `transaction ${transactionHash} was included`, ledger);
+    }
+    if (statusValue === rpc.Api.GetTransactionStatus.FAILED) {
+      return result("failed", `transaction ${transactionHash} failed on the network`, ledger);
+    }
+    if (statusValue !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
+      return result(
+        "undetermined",
+        `transaction ${transactionHash} returned an unrecognized status: ${String(statusValue)}`,
+      );
+    }
+
+    const waitMs = timeoutMs === 0 ? pollIntervalMs : Math.min(pollIntervalMs, remainingMs);
+    await abortableSleep(clock, waitMs, options.signal);
+  }
+}
+
+async function submitAdminOp(
+  op: AdminOpName,
+  params: AdminOpParams,
+  call: ContractCall,
+  admin: AdminOutcomeMetadata = { op, guard: params.guard },
+): Promise<AdminOpOutcome> {
   const outcome = await invoke({
     server: params.server,
     source: params.source ?? params.admin,
@@ -200,8 +459,22 @@ export async function submitSetPolicy(params: SetPolicyParams): Promise<AdminInv
     pollIntervalMs: params.pollIntervalMs,
     signal: params.signal,
     timeoutMs: params.timeoutMs,
+    signerTimeoutMs: params.signerTimeoutMs,
   });
-  return withAdminMetadata(outcome, {
+  const enriched = withAdminMetadata(outcome, admin);
+  return brandAdminOutcome(enriched, {
+    op,
+    guard: params.guard,
+    transactionHash: transactionHashOf(enriched),
+  });
+}
+
+/**
+ * Submit set_policy to the guard contract with an admin signer.
+ * Reuses canonical policyToScVal without duplicating encoding logic.
+ */
+export function submitSetPolicy(params: SetPolicyParams): Promise<AdminOpOutcome> {
+  return submitAdminOp("set_policy", params, buildSetPolicyCall(params.guard, params.policy), {
     op: "set_policy",
     guard: params.guard,
     policyHash: policyHash(params.policy),
@@ -211,67 +484,27 @@ export async function submitSetPolicy(params: SetPolicyParams): Promise<AdminInv
 /**
  * Submit freeze to the guard contract with an admin signer.
  */
-export async function submitFreeze(params: AdminOpParams): Promise<AdminInvokeOutcome> {
-  const call = buildFreezeCall(params.guard);
-  const outcome = await invoke({
-    server: params.server,
-    source: params.source ?? params.admin,
-    call,
-    networkPassphrase: params.networkPassphrase ?? DEFAULT_NETWORK_PASSPHRASE,
-    accountSigners: [params.admin],
-    dryRun: params.dryRun,
-    pollAttempts: params.pollAttempts,
-    pollIntervalMs: params.pollIntervalMs,
-    signal: params.signal,
-    timeoutMs: params.timeoutMs,
-  });
-  return withAdminMetadata(outcome, { op: "freeze", guard: params.guard });
+export function submitFreeze(params: AdminOpParams): Promise<AdminOpOutcome> {
+  return submitAdminOp("freeze", params, buildFreezeCall(params.guard));
 }
 
 /**
  * Submit unfreeze to the guard contract with an admin signer.
  */
-export async function submitUnfreeze(params: AdminOpParams): Promise<AdminInvokeOutcome> {
-  const call = buildUnfreezeCall(params.guard);
-  const outcome = await invoke({
-    server: params.server,
-    source: params.source ?? params.admin,
-    call,
-    networkPassphrase: params.networkPassphrase ?? DEFAULT_NETWORK_PASSPHRASE,
-    accountSigners: [params.admin],
-    dryRun: params.dryRun,
-    pollAttempts: params.pollAttempts,
-    pollIntervalMs: params.pollIntervalMs,
-    signal: params.signal,
-    timeoutMs: params.timeoutMs,
-  });
-  return withAdminMetadata(outcome, { op: "unfreeze", guard: params.guard });
+export function submitUnfreeze(params: AdminOpParams): Promise<AdminOpOutcome> {
+  return submitAdminOp("unfreeze", params, buildUnfreezeCall(params.guard));
 }
 
 /**
  * Submit rotate_agent_key to the guard contract with an admin signer.
  */
-export async function submitRotateAgentKey(
-  params: RotateAgentKeyParams,
-): Promise<AdminInvokeOutcome> {
-  const call = buildRotateAgentKeyCall(params.guard, params.newAgent);
-  const outcome = await invoke({
-    server: params.server,
-    source: params.source ?? params.admin,
-    call,
-    networkPassphrase: params.networkPassphrase ?? DEFAULT_NETWORK_PASSPHRASE,
-    accountSigners: [params.admin],
-    dryRun: params.dryRun,
-    pollAttempts: params.pollAttempts,
-    pollIntervalMs: params.pollIntervalMs,
-    signal: params.signal,
-    timeoutMs: params.timeoutMs,
-  });
-  return withAdminMetadata(outcome, {
-    op: "rotate_agent_key",
-    guard: params.guard,
-    newAgent: agentPublicKey(params.newAgent),
-  });
+export function submitRotateAgentKey(params: RotateAgentKeyParams): Promise<AdminOpOutcome> {
+  return submitAdminOp(
+    "rotate_agent_key",
+    params,
+    buildRotateAgentKeyCall(params.guard, params.newAgent),
+    { op: "rotate_agent_key", guard: params.guard, newAgent: agentPublicKey(params.newAgent) },
+  );
 }
 
 /** Parameters for {@link previewSetPolicy}. */

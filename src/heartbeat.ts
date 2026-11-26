@@ -23,6 +23,7 @@ import { DEFAULT_NETWORK_PASSPHRASE } from "./admin.ts";
 import {
   BroadcastError,
   GuardError,
+  SigningError,
   SimulationError,
   guardErrorToJSON,
   type GuardErrorJSON,
@@ -225,6 +226,10 @@ export function isRetryableHeartbeatFailure(error: unknown): boolean {
   if (error instanceof GuardBlockedError) return false;
   if (error instanceof HeartbeatBlockedError) return false;
   if (error instanceof HeartbeatDryRunError) return false;
+  // A signer timeout is a local configuration/callback failure: replaying the
+  // same heartbeat cannot make a stalled signer answer, and a timeout is never
+  // automatically retried (issue #472).
+  if (error instanceof SigningError) return false;
   if (error instanceof BroadcastError) return true;
   if (error instanceof RpcTimeoutError) return true;
   if (error instanceof SimulationError) return true;
@@ -371,6 +376,11 @@ export interface SubmitHeartbeatParams {
   pollIntervalMs?: number;
   /** Cancellation forwarded to the underlying `invoke()` pipeline. */
   signal?: AbortSignal;
+  /**
+   * Bound on the agent's `signDigest()` call, in milliseconds; `0` disables it.
+   * A fired bound is a `SignerTimeoutError` and is never retried.
+   */
+  signerTimeoutMs?: number;
 }
 
 export interface HeartbeatOptions {
@@ -419,6 +429,12 @@ export interface HeartbeatOptions {
   networkPassphrase?: string;
   pollAttempts?: number;
   pollIntervalMs?: number;
+  /**
+   * Bound on each `AgentSigner.signDigest()` call in the default submission, in
+   * milliseconds. `0` keeps the signer unbounded. It is independent of the
+   * `invoke()` deadline: whichever bound fires first decides the error class.
+   */
+  signerTimeoutMs?: number;
 
   /**
    * Optional read of the live policy, used to validate the interval against
@@ -517,6 +533,7 @@ export async function submitHeartbeat(params: SubmitHeartbeatParams): Promise<He
     ...(params.pollAttempts !== undefined ? { pollAttempts: params.pollAttempts } : {}),
     ...(params.pollIntervalMs !== undefined ? { pollIntervalMs: params.pollIntervalMs } : {}),
     ...(params.signal !== undefined ? { signal: params.signal } : {}),
+    ...(params.signerTimeoutMs !== undefined ? { signerTimeoutMs: params.signerTimeoutMs } : {}),
   });
   const ledger = outcome.kind === "allowed" ? outcome.submission.ledger : null;
   return {
@@ -688,6 +705,9 @@ function defaultSubmit(
         : {}),
       ...(options.pollAttempts !== undefined ? { pollAttempts: options.pollAttempts } : {}),
       ...(options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {}),
+      ...(options.signerTimeoutMs !== undefined
+        ? { signerTimeoutMs: options.signerTimeoutMs }
+        : {}),
       signal: context.signal,
     });
   };
@@ -736,6 +756,14 @@ function assertHeartbeatOptions(options: HeartbeatOptions): void {
     if (!Number.isFinite(stopTimeoutMs) || stopTimeoutMs < 0) {
       throw new RangeError(
         `heartbeat stopTimeoutMs must be a finite, non-negative number, received ${stopTimeoutMs}`,
+      );
+    }
+  }
+  if (options.signerTimeoutMs !== undefined) {
+    const signerTimeoutMs = options.signerTimeoutMs;
+    if (!Number.isFinite(signerTimeoutMs) || signerTimeoutMs < 0) {
+      throw new RangeError(
+        `heartbeat signerTimeoutMs must be a finite, non-negative number, received ${signerTimeoutMs}`,
       );
     }
   }

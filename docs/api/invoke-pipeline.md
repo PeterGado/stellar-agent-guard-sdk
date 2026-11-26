@@ -95,12 +95,37 @@ Every caller-controlled option is validated before any signing or RPC; a bad val
 | `timeoutMs` | `number` (≥ 0) | `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms) per RPC call | ⚠️ A fired timeout is the same fail-closed `error` outcome as an abort. `0` disables the per-call timeout (a `deadlineMs` still applies). |
 | `authRefreshMarginLedgers` | `number` (integer ≥ 0) | `DEFAULT_AUTH_REFRESH_MARGIN_LEDGERS` (5) | Ledger margin below which a signed auth entry is rebuilt and re-signed before the enforced simulation. The check reads the current ledger once after signing; a comfortable entry is not re-signed, and `0` disables the check. A failed refresh is a fail-closed `error` outcome carrying `AuthRefreshError`. |
 | `deadlineMs` | `number` (> 0) | none — only the per-call `timeoutMs` applies | ⚠️ One budget for discovery, signing, simulation, retry backoff, broadcast and polling. Expiry is fail-closed (`RpcTimeoutError` with `deadline: true`), even after the guard approved the call; a dry run reports `undetermined`. |
+| `signerTimeoutMs` | `number` (≥ 0) | none — the signer is unbounded | ⚠️ Bounds the agent's `signDigest()` call only. `0` disables it. A fired bound is a `SignerTimeoutError` (a `SigningError`, never an `RpcTimeoutError`) and is never retried. |
 | `clock` | `Clock` | `systemClock` | Time source for deadline accounting and poll/backoff delays. Must have `now()` and `sleep()`. |
 | `onStep` | `(step: InvokeStepEvent) => void` | none | One event per stage attempt (probe → sign → simulate → broadcast). Exceptions are isolated. |
 | `onRetry` | `(event: InvokeRetryEvent) => void` | none | Called once per retry, never for the first attempt, after the delay is chosen and before the next attempt starts. Carries `attempt`, `failure`, `cause`, `delayMs`, `nextAttempt`, and the `stage` that failed. Fee-bump retries report `delayMs: 0`. Exceptions are isolated: the hook cannot change the outcome, retry count or delay. |
 | `onSubmitted` | `(event: SubmissionAcceptedEvent) => void` | none | Called once with the network's answer to the broadcast, before polling, so the transaction hash survives a failed poll. |
 | `onQueue` | `(event: InvokeQueueEvent) => void` | none | Reports the per-source-account queue: `waiting` when a call joins, `acquired` when it runs, with `source`, `depth`, `waitedMs` and `acquired`. Events fire in acquisition order; a throwing hook is isolated. Counters belong to the `rpc.Server` object's queue state, so `invokeQueueStats(server)` reports only that server's accounts; without an argument it sums live server contexts in this process. The queue is per server object and process — another process using the same account is invisible. |
 | `logger` | `GuardLoggerInput` | none — silent | Stage attempts and retries at `debug`, a refusal at `info`, no-verdict outcomes at `warn`. Never changes behaviour. |
+
+### Bounding a remote signer
+
+An `AgentSigner` may be a wallet, an HSM or another process that can hang
+without rejecting. `signerTimeoutMs` puts a local bound on that single promise:
+
+```ts
+const outcome = await invoke({
+  server,
+  source,
+  call,
+  networkPassphrase,
+  signerTimeoutMs: 5_000,
+});
+if (outcome.kind === "error" && outcome.error instanceof SignerTimeoutError) {
+  // No signature was produced and nothing was broadcast; retrying this signer
+  // blindly will usually just hang again.
+}
+```
+
+It is independent of `timeoutMs` and `deadlineMs`: all three may be set, and
+whichever fires first decides the error class. A fast signer is unaffected — the
+timer is cleared as soon as it answers. `submitHeartbeat()` and
+`startHeartbeat()` accept and forward the same option.
 
 ### Fee-Bump Configuration (`feeBump`)
 

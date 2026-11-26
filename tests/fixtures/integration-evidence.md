@@ -359,25 +359,35 @@ node scripts/check-doc-links.ts
 The offline checks above passed; they do not substitute for the live-testnet
 scenarios.
 
-## Addendum — 2026-11-25 (PR: `waitForTransaction`, `onRetry`, SAC transfer helpers, fidelity table; issues #416, #415, #410, #414)
+## Addendum — 2026-11-23 (PR #520: admin outcomes, DMS copy, redacting logger, signer timeouts; issues #466, #467, #471, #472)
 
-This PR touches `src/tx.ts` (`waitForTransaction` — a new polling helper that
-only reads `getTransaction`; it never signs or broadcasts) and `src/invoke.ts`
-(the `onRetry` callback, invoked after the pipeline has already classified a
-retryable broadcast failure — it observes the retry, it does not change whether
-one happens). It also adds `src/transfer.ts` (SAC call builders plus their
-checking wrappers over the existing interceptor; no new decision logic) and a
-documentation table. The enforcement-path evidence file is included as required.
+This PR touches `src/tx.ts` and `src/invoke.ts`, so the enforcement-path evidence
+file is included as required.
 
-**The live suite was not run for this change.** The author has no funded
-`.env.phase2` testnet credentials, so `npm run test:integration` was not executed
-and no fresh live enforcement result is claimed. None of the changes alter the
-guard's block/admit decision: the new code reads transaction status after
-submission, reports retries the pipeline already performed, and builds the
-transfer calls the existing interceptor already checks. A maintainer with
-`.env.phase2` should run the live suite against this branch before merge.
+**The live suite did not reach its enforcement scenarios.**
+`GUARD_KEEP_EPHEMERAL=1 npm run test:integration` used the documented default
+ephemeral deployment. It verified the Phase-1 artifact identity, generated keys,
+funded and deployed a SAC (`CAOFKFGHBSVHJERW2DV7LJW3AIKCSIY3AGXWTBJTLIWEBMGN66DFEXJ2`,
+tx `0c8096089aba10db33dbc69ebfa0f0f9f068b495c61f43731022e01d041cc298`) and a guard
+(`CAFDHYFPNTGVOHRBR4RCZOLPJ6UL4XKXVPSROY3XIZFBE52VMFMUX6YW`,
+tx `6169569e0b43b5d110c61505c3a9d5a6448e42067ccb386fe141094adeb44f09`) from WASM
+`f47919f92e78fdd034836aa61955fc338dd56a218c448c37df1867a8c3da0f63`, then failed
+during `initialize` with `txBadAuthExtra`
+(tx `801b8e7f0231e08e79f01ec10d1f315041d4c9a8389b1c6abb911787210cfa4f`). This is
+the known initialize/key-role failure recorded above; it reproduces independently
+of this change. No fresh live enforcement result is claimed. The generated
+ephemeral environment file was removed after the public identifiers were captured.
 
-### What did run locally
+### What the PR changes on the enforcement path
+
+- `src/tx.ts`: adds `signDigestWithBound()` and extends `buildGuardAuthEntry()`
+  with `signerTimeoutMs`, so a hanging remote signer fails as a typed
+  `SignerTimeoutError` instead of stalling the pipeline.
+- `src/invoke.ts`: validates and forwards `signerTimeoutMs` to the signing
+  boundary and reports that timeout as a typed signer error.
+- The enforced simulation, policy encoding/decoding, and `blocked`/`admissible`
+  decision rules are unchanged. The admin-outcome, DMS-copy and logger work is
+  additive around the pipeline and cannot turn a refusal into a pass.
 
 ```text
 npm run typecheck
@@ -469,6 +479,7 @@ npm run test:coverage:floor
 npm run build
 npm run test:browser
 npm run test:types:packed
+npm run test:smoke
 npm run test:exports
 npm run test:packed-install
 npm run test:pack

@@ -24,6 +24,7 @@ import {
   ContractResponseError,
   FeeCapExceededError,
   GuardError,
+  SignerTimeoutError,
   SigningError,
   SimulationError,
   guardErrorToJSON,
@@ -639,6 +640,17 @@ export interface InvokeParams {
    */
   deadlineMs?: number | undefined;
   /**
+   * Local bound on each `AgentSigner.signDigest()` call, in milliseconds.
+   *
+   * A remote or threshold signer can stall long before `deadlineMs` expires.
+   * Set this to get a typed `SignerTimeoutError` (a `SigningError`) instead of
+   * waiting for the whole-pipeline `RpcTimeoutError`. `0` (or an omitted value)
+   * keeps the signer unbounded; `deadlineMs` still applies when set. When both
+   * bounds are present, whichever fires first decides the error class, and a
+   * signer timeout is never retried automatically.
+   */
+  signerTimeoutMs?: number | undefined;
+  /**
    * Time source used for deadline accounting and poll/backoff delays. Defaults
    * to `systemClock`; inject a `FakeClock` for deterministic time control.
    */
@@ -929,6 +941,9 @@ function validateInvokeOptions(params: InvokeParams): void {
   }
   if (params.deadlineMs !== undefined) {
     assertFiniteOption("deadlineMs", params.deadlineMs, 0, false);
+  }
+  if (params.signerTimeoutMs !== undefined) {
+    assertFiniteOption("signerTimeoutMs", params.signerTimeoutMs, 0);
   }
   if (params.authRefreshMarginLedgers !== undefined) {
     assertIntegerOption("authRefreshMarginLedgers", params.authRefreshMarginLedgers, 0);
@@ -2572,6 +2587,7 @@ export async function enforceCall(
               // preimage differs between legacy ADDRESS and ADDRESS_V2, so using
               // the wrong one produces a signature the account cannot verify.
               credentialType: creds.type,
+              signerTimeoutMs: params.signerTimeoutMs,
             }),
           );
         } catch (error) {
@@ -2580,7 +2596,9 @@ export async function enforceCall(
           }`;
           throw new SigningStageError(
             detail,
-            new SigningError(detail, { address, cause: error }),
+            error instanceof SignerTimeoutError
+              ? error
+              : new SigningError(detail, { address, cause: error }),
           );
         }
         continue;

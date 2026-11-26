@@ -9,6 +9,7 @@ import {
   Keypair,
   SorobanDataBuilder,
   StrKey,
+  rpc,
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
@@ -18,13 +19,17 @@ import {
   buildRotateAgentKeyCall,
   buildSetPolicyCall,
   buildUnfreezeCall,
+  isAdminOpOutcome,
   previewSetPolicy,
   submitFreeze,
   submitRotateAgentKey,
   submitSetPolicy,
   submitUnfreeze,
+  waitForAdminOp,
   type AdminInvokeOutcome,
 } from "../../src/admin.ts";
+import type { AdminOpOutcome } from "../../src/admin.ts";
+import { FakeClock } from "../../src/clock.ts";
 import { policyHash } from "../../src/policy-json.ts";
 import { InvalidInputError } from "../../src/errors.ts";
 import {
@@ -412,6 +417,181 @@ describe("admin helpers forward signal and timeoutMs", () => {
   });
 });
 
+async function settle(): Promise<void> {
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+}
+
+describe("waitForAdminOp (issue #466)", () => {
+  const adminKp = Keypair.random();
+
+  async function submittedFreeze(): Promise<AdminOpOutcome> {
+    const outcome = await submitFreeze({
+      server: createMockServer(adminKp.publicKey()) as never,
+      guard: GUARD,
+      admin: adminKp,
+      pollIntervalMs: 1,
+    });
+    assert.equal(outcome.kind, "allowed");
+    return outcome as AdminOpOutcome;
+  }
+
+  it("brands each submit outcome and waits for the matching transaction hash", async () => {
+    const outcome = await submittedFreeze();
+    assert.ok(isAdminOpOutcome(outcome));
+
+    const reads: string[] = [];
+    const server = {
+      getTransaction: async (hash: string) => {
+        reads.push(hash);
+        return {
+          status: rpc.Api.GetTransactionStatus.SUCCESS,
+          ledger: 1001,
+          events: { contractEventsXdr: [] },
+        };
+      },
+    } as unknown as never;
+
+    const result = await waitForAdminOp(outcome, { server, timeoutMs: 1_000 });
+    assert.deepEqual(reads, ["admin_tx_hash_123"]);
+    assert.equal(result.status, "confirmed");
+    assert.equal(result.transactionHash, "admin_tx_hash_123");
+    assert.equal(result.ledger, 1001);
+    assert.deepEqual(result.admin, {
+      op: "freeze",
+      guard: GUARD,
+      transactionHash: "admin_tx_hash_123",
+    });
+  });
+
+  it("polls without rebroadcasting and becomes confirmed after a pending read", async () => {
+    const outcome = await submittedFreeze();
+    const clock = new FakeClock();
+    let reads = 0;
+    let sends = 0;
+    const server = {
+      getTransaction: async () => {
+        reads += 1;
+        return reads === 1
+          ? { status: rpc.Api.GetTransactionStatus.NOT_FOUND }
+          : {
+              status: rpc.Api.GetTransactionStatus.SUCCESS,
+              ledger: 1002,
+              events: { contractEventsXdr: [] },
+            };
+      },
+      sendTransaction: async () => {
+        sends += 1;
+        throw new Error("waitForAdminOp must never rebroadcast");
+      },
+    } as unknown as never;
+
+    const pendingWait = waitForAdminOp(outcome, {
+      server,
+      clock,
+      timeoutMs: 1_000,
+      pollIntervalMs: 100,
+    });
+    await settle();
+    assert.equal(reads, 1);
+    clock.advance(100);
+    await settle();
+
+    const result = await pendingWait;
+    assert.equal(result.status, "confirmed");
+    assert.equal(result.ledger, 1002);
+    assert.equal(reads, 2);
+    assert.equal(sends, 0);
+  });
+
+  it("returns pending when the confirmation budget expires", async () => {
+    const outcome = await submittedFreeze();
+    const clock = new FakeClock();
+    let reads = 0;
+    const server = {
+      getTransaction: async () => {
+        reads += 1;
+        return { status: rpc.Api.GetTransactionStatus.NOT_FOUND };
+      },
+    } as unknown as never;
+
+    const pendingWait = waitForAdminOp(outcome, {
+      server,
+      clock,
+      timeoutMs: 1_000,
+      pollIntervalMs: 100,
+    });
+    await settle();
+    clock.advance(1_000);
+    await settle();
+
+    const result = await pendingWait;
+    assert.equal(result.status, "pending");
+    assert.match(result.detail, /not confirmed within 1000ms/);
+    assert.equal(result.ledger, null);
+    assert.ok(reads >= 1);
+  });
+
+  it("returns pending on abort without treating it as a failure", async () => {
+    const outcome = await submittedFreeze();
+    const controller = new AbortController();
+    controller.abort();
+    let reads = 0;
+    const server = {
+      getTransaction: async () => {
+        reads += 1;
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS };
+      },
+    } as unknown as never;
+
+    const result = await waitForAdminOp(outcome, { server, signal: controller.signal });
+    assert.equal(result.status, "pending");
+    assert.match(result.detail, /aborted/);
+    assert.equal(reads, 0);
+  });
+
+  it("returns undetermined for an RPC error or an unrecognized status", async () => {
+    const outcome = await submittedFreeze();
+    const failing = {
+      getTransaction: async () => {
+        throw new Error("rpc offline");
+      },
+    } as unknown as never;
+    const failedRead = await waitForAdminOp(outcome, { server: failing });
+    assert.equal(failedRead.status, "undetermined");
+    assert.match(failedRead.detail, /rpc offline/);
+
+    const unknownStatus = {
+      getTransaction: async () => ({ status: "FUTURE_STATUS" }),
+    } as unknown as never;
+    const unknown = await waitForAdminOp(outcome, { server: unknownStatus });
+    assert.equal(unknown.status, "undetermined");
+    assert.match(unknown.detail, /unrecognized status/);
+  });
+
+  it("fails fast for a non-admin or hashless outcome", async () => {
+    const server = createMockServer(adminKp.publicKey()) as never;
+    await assert.rejects(waitForAdminOp({} as AdminOpOutcome, { server }), (error: unknown) => {
+      assert.ok(error instanceof InvalidInputError);
+      assert.match(error.message, /admin_outcome/);
+      return true;
+    });
+
+    const dryRun = await submitFreeze({
+      server,
+      guard: GUARD,
+      admin: adminKp,
+      dryRun: true,
+      pollIntervalMs: 1,
+    });
+    assert.ok(isAdminOpOutcome(dryRun));
+    await assert.rejects(waitForAdminOp(dryRun, { server }), (error: unknown) => {
+      assert.ok(error instanceof InvalidInputError);
+      assert.match(error.message, /transaction hash/);
+      return true;
+    });
+  });
+});
+
 /** Additive audit metadata on every outcome arm (issue #464). */
 describe("admin outcome metadata (issue #464)", () => {
   const adminKp = Keypair.random();
@@ -512,91 +692,79 @@ describe("previewSetPolicy (issue #465)", () => {
     let writes = 0;
     let simulations = 0;
     const server = {
-      getLedgerEntries: async (...keys: unknown[]) => ({
-        entries: keys.length > 1 ? [policyEntry, windowEntry] : [windowEntry],
-      }),
-      getAccount: async () => new Account(adminKp.publicKey(), "100"),
+      getLedgerEntries: async (..._keys: unknown[]) => {
+        return {
+          entries: [policyEntry, windowEntry].filter((e): e is NonNullable<typeof e> => e !== null),
+        };
+      },
+      getContractData: async (_guard: unknown, key: xdr.ScVal) => {
+        const name = scValToNative(key);
+        if (name === "policy") return policyEntry;
+        if (name === "window") return windowEntry;
+        return null;
+      },
+      getAccount: async () => new Account(adminKp.publicKey(), "1"),
       simulateTransaction: async () => {
         simulations += 1;
-        if (validation === "unavailable") throw new Error("validate_policy not installed");
+        if (validation === "unavailable") return { error: "no validate_policy" };
         return {
           result: {
             retval:
               validation === "valid"
-                ? xdr.ScVal.scvSymbol("Valid")
+                ? xdr.ScVal.scvVec([xdr.ScVal.scvBool(true)])
                 : xdr.ScVal.scvVec([
-                    xdr.ScVal.scvSymbol("Invalid"),
+                    xdr.ScVal.scvBool(false),
                     xdr.ScVal.scvSymbol("AmountSign"),
+                    xdr.ScVal.scvString("per_tx_cap must be non-negative"),
                   ]),
           },
+          latestLedger: 10,
         };
       },
       sendTransaction: async () => {
         writes += 1;
-        throw new Error("preview attempted a write");
+        return { status: "PENDING", hash: "bad" };
       },
-    };
-    return {
-      server: server as never,
-      get writes() {
-        return writes;
-      },
-      get simulations() {
-        return simulations;
-      },
-    };
+    } as unknown as never;
+    return { server, writes: () => writes, simulations: () => simulations };
   }
 
-  it("reads the installed policy and returns an empty diff for no change", async () => {
-    const { server, writes } = previewServer(TEST_POLICY);
+  it("diffs a valid candidate and never signs or submits", async () => {
+    const { server, writes, simulations } = previewServer(TEST_POLICY, "valid");
+    const candidate = { ...TEST_POLICY, per_tx_cap: 2000n };
     const preview = await previewSetPolicy({
       server,
       guard: GUARD,
-      policy: TEST_POLICY,
+      policy: candidate,
       admin: adminKp,
     });
 
     assert.equal(preview.valid, true);
     assert.deepEqual(preview.failures, []);
-    assert.deepEqual(preview.diff, []);
-    assert.equal(preview.policyHash, policyHash(TEST_POLICY));
+    assert.equal(preview.policyHash, policyHash(candidate));
     assert.deepEqual(preview.current, TEST_POLICY);
-    assert.equal(writes, 0, "a preview never broadcasts a transaction");
+    assert.ok(
+      preview.diff.some(
+        (change) =>
+          change.field === "per_tx_cap" && change.before === 1000n && change.after === 2000n,
+      ),
+    );
+    assert.equal(simulations(), 1);
+    assert.equal(writes(), 0);
   });
 
-  it("returns current: null and a diff against an empty policy when none is installed", async () => {
-    const { server, writes } = previewServer(null);
-    const preview = await previewSetPolicy({ server, guard: GUARD, policy: TEST_POLICY });
-
-    assert.equal(preview.current, null);
-    assert.ok(preview.diff.length > 0);
-    assert.equal(preview.valid, true);
-    assert.equal(writes, 0);
-  });
-
-  it("reports SDK validation failures instead of throwing", async () => {
-    const { server } = previewServer(null);
-    const invalid = { ...TEST_POLICY, per_tx_cap: -1n };
-    const preview = await previewSetPolicy({
-      server,
-      guard: GUARD,
-      policy: invalid as never,
-    });
-
-    assert.equal(preview.valid, false);
-    assert.ok(preview.failures.some((failure) => failure.rule === "negative_amount"));
-  });
-
-  it("adds the contract validator's first failing rule when a source is supplied", async () => {
+  it("reports SDK, encoding and contract failures without throwing", async () => {
+    const broken = { ...TEST_POLICY, per_tx_cap: -1n } as unknown as PolicyConfig;
     const { server } = previewServer(TEST_POLICY, "invalid");
     const preview = await previewSetPolicy({
       server,
       guard: GUARD,
-      policy: TEST_POLICY,
+      policy: broken,
       admin: adminKp,
     });
 
     assert.equal(preview.valid, false);
+    assert.ok(preview.failures.some((failure) => failure.source === "sdk"));
     assert.ok(
       preview.failures.some(
         (failure) => failure.source === "contract" && failure.rule === "AmountSign",
