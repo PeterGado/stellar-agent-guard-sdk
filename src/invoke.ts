@@ -267,6 +267,17 @@ const RETRYABLE_CAUSES = {
 } as const satisfies Record<RetryableInvokeFailure, InvokeErrorCause>;
 
 /** The error arm returned by one invocation attempt. */
+export interface InvokeTiming {
+  /** ISO-8601 timestamp when `invoke()` started. */
+  startedAt: string;
+  /** ISO-8601 timestamp when the transaction was accepted by the RPC, if broadcast. */
+  submittedAt?: string | undefined;
+  /** ISO-8601 timestamp when the transaction was confirmed on-ledger, if confirmed. */
+  confirmedAt?: string | undefined;
+  /** Total elapsed duration in milliseconds from `startedAt` to terminal outcome. */
+  durationMs: number;
+}
+
 export interface InvokeErrorOutcome {
   kind: "error";
   detail: string;
@@ -467,6 +478,8 @@ export interface InvokePendingOutcome {
   guidance: string;
   /** Structured retry metadata attached to the outcome. */
   retry?: InvokeRetryMetadata | undefined;
+  /** Normalised timing fields for this terminal outcome. */
+  timing?: InvokeTiming | undefined;
 }
 
 export type PipelineOutcome =
@@ -475,6 +488,8 @@ export type PipelineOutcome =
       submission: SubmissionResult;
       /** Structured retry metadata attached to the terminal outcome. */
       retry?: InvokeRetryMetadata | undefined;
+      /** Normalised timing fields for this terminal outcome. */
+      timing?: InvokeTiming | undefined;
     }
   | {
       kind: "blocked";
@@ -489,6 +504,8 @@ export type PipelineOutcome =
       charged?: boolean;
       /** Structured retry metadata attached to the terminal outcome. */
       retry?: InvokeRetryMetadata | undefined;
+      /** Normalised timing fields for this terminal outcome. */
+      timing?: InvokeTiming | undefined;
     }
   | InvokePendingOutcome
   | InvokeErrorOutcome
@@ -1618,9 +1635,31 @@ export async function invoke(input: InvokeParamsInput): Promise<InvokeOutcome> {
   validateInvokeOptions(params);
 
   const clock = params.clock ?? systemClock;
+  const startedAtMs = clock.now();
+  let submittedAtMs: number | undefined;
+  const attachTiming = (outcome: InvokeOutcome): InvokeOutcome => {
+    if (
+      outcome instanceof BroadcastError ||
+      outcome instanceof InvokeRetryError ||
+      "verdict" in outcome
+    ) {
+      return outcome;
+    }
+    const nowMs = clock.now();
+    const timing: InvokeTiming = {
+      startedAt: new Date(startedAtMs).toISOString(),
+      ...(submittedAtMs !== undefined
+        ? { submittedAt: new Date(submittedAtMs).toISOString() }
+        : {}),
+      ...(outcome.kind === "allowed" ? { confirmedAt: new Date(nowMs).toISOString() } : {}),
+      durationMs: Math.max(0, nowMs - startedAtMs),
+    };
+    return { ...outcome, timing } as InvokeOutcome;
+  };
+
   const deadline = makeDeadline(params, clock);
   if (deadline !== undefined && deadline.expired()) {
-    return timeoutOutcome(deadlineTimeout("invoke"));
+    return attachTiming(timeoutOutcome(deadlineTimeout("invoke")));
   }
 
   // A dry run performs exactly one pass: it never reaches broadcast, so there
@@ -1643,25 +1682,37 @@ export async function invoke(input: InvokeParamsInput): Promise<InvokeOutcome> {
     }
   }
 
+  const trackedParams: InvokeParams = {
+    ...params,
+    onSubmitted: (ev) => {
+      if (ev.hash !== null) {
+        submittedAtMs = clock.now();
+      }
+      params.onSubmitted?.(ev);
+    },
+  };
+
   try {
     // Every RPC the pipeline makes sits inside this bound: an already-aborted
     // signal short-circuits before the account is looked up, and a mid-flight
     // abort or a fired timeout rejects promptly with `RpcTimeoutError`.
-    return await withRpcAbort(
-      {
-        stage: "invoke",
-        signal: params.signal,
-        // With a deadline, the outer race is the smaller of the per-call bound
-        // and the time left; `timeoutMs: 0` disables only the former.
-        timeoutMs: outerRpcTimeout(params, deadline),
-      },
-      () => invokeWithQueue(params, deadline, clock),
+    return attachTiming(
+      await withRpcAbort(
+        {
+          stage: "invoke",
+          signal: params.signal,
+          // With a deadline, the outer race is the smaller of the per-call bound
+          // and the time left; `timeoutMs: 0` disables only the former.
+          timeoutMs: outerRpcTimeout(params, deadline),
+        },
+        () => invokeWithQueue(trackedParams, deadline, clock),
+      ),
     );
   } catch (error) {
     if (error instanceof RpcTimeoutError) {
       // A bound that fired is a fail-closed *decision*, not a crash: the guard
       // never reached a verdict, which is exactly the `error` arm's meaning.
-      return timeoutOutcome(error);
+      return attachTiming(timeoutOutcome(error));
     }
     throw error;
   }
