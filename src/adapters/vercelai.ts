@@ -44,12 +44,15 @@ import {
   hookContextFor,
   mapContractCalls,
   mappingFailureFor,
+  resolveCorrelationId,
   runBatchDecisionHook,
   runDecisionHook,
   runMappingErrorHook,
   type BlockedHookLogger,
   type GuardBatchDecisionHook,
+  type GuardHookContext,
   type GuardMappingErrorHook,
+  type CorrelationIdOption,
 } from "./shared.ts";
 
 /**

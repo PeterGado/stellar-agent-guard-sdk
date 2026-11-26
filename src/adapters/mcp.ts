@@ -42,6 +42,7 @@ import {
   hostAbortSignal,
   mapContractCalls,
   mappingFailureFor,
+  resolveCorrelationId,
   runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
@@ -51,6 +52,7 @@ import {
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
+  type CorrelationIdOption,
 } from "./shared.ts";
 
 /** The one field of a tool call this adapter reads. */

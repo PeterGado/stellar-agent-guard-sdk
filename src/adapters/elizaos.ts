@@ -57,6 +57,7 @@ import {
   mappingFailureFor,
   normalizeMappedCall,
   normalizeMappedCalls,
+  resolveCorrelationId,
   runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
@@ -66,6 +67,7 @@ import {
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
+  type CorrelationIdOption,
 } from "./shared.ts";
 
 /** The subset of ElizaOS's `Validator` signature this adapter implements. */

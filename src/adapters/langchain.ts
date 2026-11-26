@@ -66,6 +66,7 @@ import {
   mapContractCalls,
   mappingFailureFor,
   mergeAbortSignals,
+  resolveCorrelationId,
   runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
@@ -75,6 +76,7 @@ import {
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
+  type CorrelationIdOption,
 } from "./shared.ts";
 
 /** The subset of LangChain's `ToolCallRequest` this adapter reads. */

@@ -22,7 +22,10 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createLangChainGuardMiddleware } from "../../src/adapters/langchain.ts";
+import {
+  createLangChainGuardMiddleware,
+  type LangChainToolCallRequest,
+} from "../../src/adapters/langchain.ts";
 import { DEFAULT_ADAPTER_TIMEOUT_MS, mapContractCalls } from "../../src/adapters/shared.ts";
 import { DEFAULT_RPC_TIMEOUT_MS } from "../../src/invoke.ts";
 import { createGuardValidator } from "../../src/adapters/elizaos.ts";
@@ -1021,7 +1024,7 @@ describe("adapter correlation ids (issue #459)", () => {
     const middleware = createLangChainGuardMiddleware({
       interceptor: stub(BLOCKED),
       toContractCall: () => CALL,
-      correlationId: (request) => request.toolCall.id,
+      correlationId: (request: LangChainToolCallRequest) => request.toolCall.id,
       onBlocked: (info) => blocked.push(info),
     });
 
