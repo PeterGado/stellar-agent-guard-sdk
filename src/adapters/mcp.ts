@@ -33,6 +33,7 @@ import type {
 } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
 import {
+  batchDecisionKindFor,
   blockedInfoFor,
   blockedInfoForBatch,
   checkOptionsFor,
@@ -41,12 +42,12 @@ import {
   hostAbortSignal,
   mapContractCalls,
   mappingFailureFor,
-  resolveCorrelationId,
+  runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
   runMappingErrorHook,
   type BlockedHookLogger,
-  type CorrelationIdOption,
+  type GuardBatchDecisionHook,
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
@@ -109,6 +110,13 @@ export interface McpGuardOptions {
    * may identify a user or run, so do not log it with secrets.
    */
   correlationId?: CorrelationIdOption<[request: McpToolCallRequest]>;
+  /**
+   * Action-level batch decision summary hook (issue #498).
+   *
+   * Called once per batch check with `{ adapter: "mcp", kind, verdicts, calls, correlationId? }`
+   * after all calls have been checked, before the handler runs or the refusal is returned.
+   */
+  onBatchDecision?: GuardBatchDecisionHook | undefined;
   /**
    * Operator alerting on every halt, on the same shared payload as the other
    * adapters (`{ adapter: "mcp", kind, reason, call, explanation }`). A throwing
@@ -253,6 +261,17 @@ async function guardMcpRequest<T extends McpToolResult>(
       options.blockedHookLogger,
     );
   }
+  runBatchDecisionHook(
+    options.onBatchDecision,
+    {
+      adapter: "mcp",
+      kind: batchDecisionKindFor(batch.verdicts),
+      verdicts: batch.verdicts,
+      calls,
+      correlationId: (request as { id?: string }).id,
+    },
+    options.blockedHookLogger,
+  );
   if (batch.admissible) return proceed();
 
   runBlockedHook(

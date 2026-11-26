@@ -56,6 +56,7 @@ import {
 } from "./validate.ts";
 import { GuardError } from "../errors.ts";
 import {
+  batchDecisionKindFor,
   blockedInfoFor,
   blockedInfoForBatch,
   checkOptionsFor,
@@ -65,12 +66,12 @@ import {
   mapContractCalls,
   mappingFailureFor,
   mergeAbortSignals,
-  resolveCorrelationId,
+  runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
   runMappingErrorHook,
   type BlockedHookLogger,
-  type CorrelationIdOption,
+  type GuardBatchDecisionHook,
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
@@ -124,6 +125,13 @@ export interface LangChainGuardOptions {
    * metadata: it may identify a user or run, so do not log it with secrets.
    */
   correlationId?: CorrelationIdOption<[request: LangChainToolCallRequest]>;
+  /**
+   * Action-level batch decision summary hook (issue #498).
+   *
+   * Called once per batch check with `{ adapter: "langchain", kind, verdicts, calls, correlationId? }`
+   * after all calls have been checked, before the handler runs or the refusal is returned.
+   */
+  onBatchDecision?: GuardBatchDecisionHook | undefined;
   /**
    * Operator alerting: called once per halt with a structured payload
    * (`{ adapter, kind, reason, call, explanation }`), so a refusal reaches a
@@ -223,6 +231,8 @@ export function createLangChainGuardMiddleware(options: LangChainGuardOptions) {
   if (nameIssue) issues.push(nameIssue);
   const onDecisionIssue = validateOptionalFunction("onDecision", options.onDecision);
   if (onDecisionIssue) issues.push(onDecisionIssue);
+  const onBatchDecisionIssue = validateOptionalFunction("onBatchDecision", options.onBatchDecision);
+  if (onBatchDecisionIssue) issues.push(onBatchDecisionIssue);
   const onMappingErrorIssue = validateOptionalFunction("onMappingError", options.onMappingError);
   if (onMappingErrorIssue) issues.push(onMappingErrorIssue);
   const onStepIssue = validateOptionalFunction("onStep", options.onStep);
@@ -355,6 +365,17 @@ export function createLangChainGuardMiddleware(options: LangChainGuardOptions) {
           options.blockedHookLogger,
         );
       }
+      runBatchDecisionHook(
+        options.onBatchDecision,
+        {
+          adapter: "langchain",
+          kind: batchDecisionKindFor(batch.verdicts),
+          verdicts: batch.verdicts,
+          calls,
+          correlationId: request.toolCall.id,
+        },
+        options.blockedHookLogger,
+      );
       if (batch.admissible) return handler(request);
 
       runBlockedHook(

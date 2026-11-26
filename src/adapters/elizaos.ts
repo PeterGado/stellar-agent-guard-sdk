@@ -48,6 +48,7 @@ import {
   type AdapterConfigIssue,
 } from "./validate.ts";
 import {
+  batchDecisionKindFor,
   blockedInfoFor,
   blockedInfoForBatch,
   checkOptionsFor,
@@ -56,12 +57,12 @@ import {
   mappingFailureFor,
   normalizeMappedCall,
   normalizeMappedCalls,
-  resolveCorrelationId,
+  runBatchDecisionHook,
   runBlockedHook,
   runDecisionHook,
   runMappingErrorHook,
   type BlockedHookLogger,
-  type CorrelationIdOption,
+  type GuardBatchDecisionHook,
   type GuardBlockedHook,
   type GuardHookContext,
   type GuardMappingErrorHook,
@@ -113,6 +114,13 @@ export interface ElizaGuardOptions {
    * it may identify a user or run, so do not log it with secrets.
    */
   correlationId?: CorrelationIdOption<[message: unknown, state: unknown]>;
+  /**
+   * Action-level batch decision summary hook (issue #498).
+   *
+   * Called once per batch check with `{ adapter: "elizaos", kind, verdicts, calls }`
+   * after all calls have been checked, before returning the boolean validation outcome.
+   */
+  onBatchDecision?: GuardBatchDecisionHook | undefined;
   /**
    * Operator alerting: called once per halt with the same structured payload
    * every adapter uses (`{ adapter, kind, reason, call, explanation }`). A
@@ -182,6 +190,8 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
   if (baseValidateIssue) issues.push(baseValidateIssue);
   const onDecisionIssue = validateOptionalFunction("onDecision", options.onDecision);
   if (onDecisionIssue) issues.push(onDecisionIssue);
+  const onBatchDecisionIssue = validateOptionalFunction("onBatchDecision", options.onBatchDecision);
+  if (onBatchDecisionIssue) issues.push(onBatchDecisionIssue);
   const onBlockedIssue = validateOptionalFunction("onBlocked", options.onBlocked);
   if (onBlockedIssue) issues.push(onBlockedIssue);
   const onMappingErrorIssue = validateOptionalFunction("onMappingError", options.onMappingError);
@@ -280,6 +290,16 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
         options.blockedHookLogger,
       );
     }
+    runBatchDecisionHook(
+      options.onBatchDecision,
+      {
+        adapter: "elizaos",
+        kind: batchDecisionKindFor(batch.verdicts),
+        verdicts: batch.verdicts,
+        calls,
+      },
+      options.blockedHookLogger,
+    );
     if (batch.admissible) return true;
 
     runBlockedHook(
