@@ -35,6 +35,7 @@ export {
   PolicyEncodeError,
   PolicyFileReadError,
   PolicyValidationError,
+  SignerTimeoutError,
   SigningError,
   RateLimitedError,
   SimulationError,
@@ -97,10 +98,15 @@ export {
 
 export type { ActiveWindowState, DescribePolicyOptions } from "./policy.ts";
 
-export { DMS_WARN_RATIO_DEFAULT, dmsUrgency } from "./dms.ts";
+export { DMS_WARN_RATIO_DEFAULT, dmsUrgency, formatDmsCountdown } from "./dms.ts";
 export { formatPolicyDiff, policyDiff } from "./policy-diff.ts";
 export type { PolicyChange, PolicyValue } from "./policy-diff.ts";
-export type { DmsUrgency } from "./dms.ts";
+export type {
+  DmsCountdown,
+  DmsCountdownState,
+  DmsUrgency,
+  FormatDmsCountdownOptions,
+} from "./dms.ts";
 
 export type {
   AccountAddress,
@@ -125,6 +131,7 @@ export {
   decodePolicyJson,
   encodePolicyJson,
   policyFromJson,
+  policyHash,
   policyToJson,
 } from "./policy-json.ts";
 
@@ -298,6 +305,7 @@ export {
   InMemoryCursorStore,
   compareCommittedEvents,
   computePollDelay,
+  describeGap,
   describeGuardEvent,
   diagnosticsToEvents,
   guardEventId,
@@ -392,19 +400,40 @@ export {
 export type { TransferFromRequest, TransferRequest } from "./transfer.ts";
 
 export {
+  DEFAULT_ADMIN_OP_WAIT_TIMEOUT_MS,
   DEFAULT_NETWORK_PASSPHRASE,
   agentPubkeyToScVal,
   buildFreezeCall,
   buildRotateAgentKeyCall,
   buildSetPolicyCall,
   buildUnfreezeCall,
+  isAdminOpOutcome,
+  previewSetPolicy,
   submitFreeze,
   submitRotateAgentKey,
   submitSetPolicy,
   submitUnfreeze,
+  waitForAdminOp,
 } from "./admin.ts";
 
-export type { AdminOpParams, RotateAgentKeyParams, SetPolicyParams } from "./admin.ts";
+export type {
+  AdminInvokeOutcome,
+  AdminOpMetadata,
+  AdminOpName,
+  AdminOpOutcome,
+  AdminOpParams,
+  AdminOpWaitResult,
+  AdminOpWaitStatus,
+  AdminOperation,
+  AdminOutcomeMetadata,
+  PolicyPreview,
+  PolicyPreviewFailure,
+  PolicyPreviewFailureSource,
+  PreviewSetPolicyParams,
+  RotateAgentKeyParams,
+  SetPolicyParams,
+  WaitForAdminOpOptions,
+} from "./admin.ts";
 
 export {
   GUARD_WASM_HASH,
@@ -420,6 +449,7 @@ export {
   HeartbeatBlockedError,
   HeartbeatDryRunError,
   HeartbeatIntervalError,
+  InMemoryHeartbeatStateStore,
   heartbeat,
   isRetryableHeartbeatFailure,
   readGuardStatus,
@@ -428,10 +458,13 @@ export {
   type HeartbeatBeat,
   type HeartbeatHandle,
   type HeartbeatJitter,
+  type HeartbeatLateBeat,
   type HeartbeatOptions,
   type HeartbeatParams,
   type HeartbeatResult,
   type HeartbeatRetryOptions,
+  type HeartbeatState,
+  type HeartbeatStateStore,
   type HeartbeatStopOptions,
   type HeartbeatStopResult,
   type HeartbeatSubmission,
@@ -522,6 +555,7 @@ export type {
 // when no logger is supplied: the SDK writes nothing unless a host asks.
 export {
   GUARD_LOG_LEVELS,
+  createRedactingLogger,
   redactLogMeta,
   SILENT_LOGGER,
   resolveLogger,
